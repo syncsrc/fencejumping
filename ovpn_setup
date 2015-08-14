@@ -1,0 +1,478 @@
+#!/bin/bash
+
+###############
+# OpenVPN setup
+#
+# This script will deploy a basic openvpn server instance and generate client
+# configuration files to connect to it. Because private keys are embedded into
+# the client configuration files to simplify client setup, this script should 
+# not be used in security or privacy critical settings. 
+#
+# Usage:
+# This script must be run as root (run 'chmod +x ovpn_setup' to make it executable
+# if it isn't). It will attempt to determine the server's public IP to
+# use for the OpenVPN service, if multiple interfaces are found it will ask for
+# one to be specified. The -s and -e options only need to be run once to enable
+# the server, if multiple clients are desired the script should be run as many times
+# as necessary to generate unique client config files. If -d option is used and
+# the server FQDN resolves to the detected public IP, client config files will
+# use the FQDN instead of the IP.
+#
+usage="
+ovpn_setup [-e] [-l] [-k keysize] [-i interface] [-s servername] [-d domainname] [-c clientname] > setup.log
+    -e :            enable server (copy config files and start service)
+    -l :            Enable DNS updating for linux clients (using update-resolv-conf script)
+    -k keysize:     RSA key size to use (default 2048)
+    -i interface:   public interface OpenVPN server should listen on
+    -s servername:  name to give to server instance
+    -d domainname:  server domain name
+    -c clientname:  unique name for client instance"
+#
+# Tested on:
+#   Debian 7, 6
+#   Ubuntu 14.04, 12.04
+#   Centos 7, 6, 5
+#   Fedora 20, 19
+#
+# Known Issues:
+#   1) Does not handle unicode names, which would be hard.
+#   2) Will conflict with other uses of the 172.30.*.* subnet.
+#   3) Does not play nice with SELinux, and will disable it. To re-enable SELinux,
+#      run 'setenforce 1'. You will need to manually configure /etc/openvpn/ovpn_net.sh
+#      to run at boot (or find another way to make those settings persistent).
+#
+# Needs testing:
+#   1) Client DNS updating, especially for linux clients. 
+#   2) Routing of client DNS requests. Add a --route command to config?
+#
+###############
+# Copyright (c) 2014, syncsrc.org
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice, this
+#    list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+# ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+# WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+# ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+# (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+# LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+# ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+# SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+###############
+
+### Parse command line parameters
+keysize=2048
+ifcname=""
+servername=""
+clientname=""
+domainname="fake.name"
+enableserver=false
+linuxclient=false
+while getopts :i:k:s:c:d:el opt; do
+    case $opt in
+	:)
+	    echo "Error: no argument specified for -$OPTARG" >&2
+	    exit 1
+	    ;;
+        i)
+            if [ "$ifcname" == "" ]; then
+		if [[ $OPTARG =~ ^[a-zA-Z0-9]+$ ]]; then
+                    ifcname=$OPTARG
+                    echo "Specified optional network interface name: $ifcname" >&2
+		else
+		    echo "Error: $OPTARG is not a valid interface." >&2
+		    exit 1
+		fi
+            else
+                echo "Error: Only one network interface allowed." >&2
+                exit 1
+            fi
+            ;;
+        k)
+            if [[ $OPTARG =~ ^[0-9]+$ ]]; then
+		keysize=$OPTARG
+	    else
+		echo "Error: $OPTARG is not a valid key size." >&2
+		exit 1
+            fi
+            ;;
+        c)
+            if [ "$clientname" == "" ]; then
+		if [[ $OPTARG =~ ^[a-zA-Z0-9]+$ ]]; then
+                    clientname=$OPTARG
+                    echo "Will use $clientname for client cert name." >&2
+		else
+		    echo "Error: $OPTARG is not a valid client name." >&2
+		    exit 1
+		fi
+            else
+                echo "Error: Can only generate one client cert at a time." >&2
+                exit 1
+            fi
+            ;;
+        s)
+            if [ "$servername" == "" ]; then
+		if [[ $OPTARG =~ ^[a-zA-Z0-9]+$ ]]; then
+                    servername=$OPTARG
+                    echo "Will use $servername for server cert name." >&2
+		else
+		    echo "Error: $OPTARG is not a valid server name." >&2
+		    exit 1
+		fi
+            else
+                echo "Error: Only one server allowed." >&2
+                exit 1
+            fi
+            ;;
+	d)
+            if [ "$domainname" == "fake.name" ]; then
+		if [[ $OPTARG =~ ^[a-zA-Z0-9]+([-.]?[a-zA-Z0-9]+)*.[a-zA-Z]+$ ]]; then
+                    domainname=$OPTARG
+                    echo "Will use $domainname for server domain." >&2
+		else
+		    echo "Error: $OPTARG is not a valid domain name." >&2
+		    exit 1
+		fi
+            else
+                echo "Error: Only one domain allowed." >&2
+                exit 1
+            fi
+	    ;;
+        e)
+            enableserver=true
+            echo "Server will be enabled after config and key files are generated." >&2
+            ;;
+        l)
+            linuxclient=true
+            echo "Using update-resolv-conf script to update client DNS instead of --register-dns." >&2
+            ;;
+        \?)
+	    IFS='%'
+            echo -e $usage >&2
+	    unset IFS
+            exit 1
+            ;;
+    esac
+done
+
+
+### Sanity check keysize against previous runs
+if [ -r "./vars" ]; then
+    oldkeysize=$(grep "export KEY_SIZE" ./vars | awk -F "[ =]" '{print $NF}')
+    if [ $keysize -ne $oldkeysize ]; then
+	echo "Error: Specified keysize of $keysize does not match previously used keysize of $oldkeysize." >&2
+	exit 1
+    fi
+fi
+
+
+### Try and get WAN IP address to use
+### If there are multiple interfaces then one will need to be specified
+ifcs=$(ip addr | grep 'UP' -A2 | grep 'scope global' | grep -v "tun0" | wc -l)
+if [ "$ifcname" != "" ]; then
+    if [ $(ip addr | grep 'UP' -A2 | grep "$ifcname" | wc -l) -eq 0 ]; then
+	echo "Error: Could not find the specified interface. Is it up?" >&2
+	exit 1
+    else
+	addr=$(ip addr | grep 'UP' -A2 | grep 'scope global' | grep "$ifcname" | awk -F'[ \/]+' '{print $3}' 2>/dev/null)
+	echo "Using server IP: $addr" >&2
+    fi
+elif [ $ifcs -eq 1 ]; then
+    addr=$(ip addr | grep 'UP' -A2 | grep 'scope global' | grep -v "tun0" | awk -F'[ \/]+' '{print $3}' 2>/dev/null)
+    echo "Using server IP: $addr" >&2
+elif [ $ifcs -gt 1 ]; then
+    echo "Multiple interfaces found, please specify an interface with -i" >&2
+    while read -r line; do
+        echo $line | awk -F'[ \/]+' '{print $8 ": " $2}' 2>/dev/null >&2
+    done <<< "$(ip addr | grep 'UP' -A2 | grep 'scope global')"
+    exit 1
+else
+    echo "Error: No interfaces found." >&2
+    exit 1
+fi
+
+
+### If a domain name is provided, check server FQDN for use in client configs
+if [ "$domainname" == "fake.name" ]; then
+    serveraddr=$addr
+else
+    ### attempt to resolve server name, courtesy of stackexchange
+    if [ -n "$(command -v dig)" ]; then
+	dnsaddr=$(dig +short $servername.$domainname)
+    elif [ -n "$(command -v host)" ]; then
+	dnsaddr=$(host $servername.$domainname | awk '/has address/ { print $4 }')
+    elif [ -n "$(command -v nslookup)" ]; then
+	dnsaddr=$(nslookup $servername.$domainname | awk '/^Address: / { print $2 }')
+    elif [ -n "$(command -v ping)" ]; then
+	dnsaddr=$(ping -c1 -t1 -W0 $servername.$domainname 2>&1 | tr -d '():' | awk '/^PING/{print $3}')
+    else
+	echo "Warning: Cant figure out how to do dns lookups." >&2
+	dnsaddr=""
+    fi
+
+    ### Compare reolved FQDN to public IP
+    if [ "$addr" == "$dnsaddr" ]; then
+	echo "Clients will connect to $servername.$domainname instead of $addr" >&2
+	serveraddr="$servername.$domainname"
+    else
+	echo "Warning: $servername.$domainname did not resolve to $addr, clients will not use FQDN." >&2
+	serveraddr=$addr
+    fi
+fi
+
+### Get host's first DNS server to push to client. 
+### This *should* force DNS through the tunnel.
+dnsserver=$(grep -i -m 1 "nameserver" /etc/resolv.conf | awk '{print $2}')
+if [ "$dnsserver" == "" ]; then
+    dnsserver="8.8.8.8"
+fi
+
+
+
+###############
+# Server setup
+###############
+if [ "$servername" != "" ]; then
+
+    ### Install packages (if already present should be a no-op)
+    ### Look at all these special snowflakes.
+    if [ -f "/etc/redhat-release" ]; then
+        if [ $(yum repolist | grep -i "centos" | wc -l) -gt 0 ] && [ $(yum repolist | grep -i "epel" | wc -l) -eq 0 ]; then
+            #ver=$(cat /etc/redhat-release | awk -F "[ \.]" '{print $3}' 2>/dev/null)
+	    ver=$(cat /etc/redhat-release | awk -F "." '{print $1}' | awk '{print $NF}')
+	    yum -y install wget
+	    if [ $ver -eq 7 ]; then
+	        wget http://dl.fedoraproject.org/pub/epel/7/x86_64/e/epel-release-7-1.noarch.rpm
+		rpm -Uvh epel-release-7-1.noarch.rpm
+            elif [ $ver -eq 6 ]; then
+                wget http://dl.fedoraproject.org/pub/epel/6/i386/epel-release-6-8.noarch.rpm
+                rpm -Uvh epel-release-6-8.noarch.rpm
+            elif [ $ver -eq 5 ]; then
+                wget http://dl.fedoraproject.org/pub/epel/5/i386/epel-release-5-4.noarch.rpm
+                rpm -Uvh epel-release-5-4.noarch.rpm
+            else
+                echo "Error: I don't know how to setup this version of CentOS." >&2
+            fi
+        fi
+        yum -y install openvpn easy-rsa
+    elif [ -f "/etc/debian_version" ]; then
+        apt-get update
+        apt-get -y install openvpn
+        if [ $(apt-cache search easy-rsa | wc -l) -gt 0 ]; then
+            apt-get -y install easy-rsa
+        fi
+    elif [ -f "/etc/SuSE-release" ]; then
+        echo "Unsupported distro." >&2
+        exit 1
+    elif [ -f "/etc/arch-release" ]; then
+        echo "Unsupported distro." >&2
+        exit 1
+    elif [ -f "/etc/gentoo-release" ]; then
+        echo "Unsupported distro." >&2
+        exit 1
+    else
+        echo "Error: Could not detect distribution." >&2
+        exit 1
+    fi
+
+
+    ### Try and locate easy-rsa for key and cert generation
+    if [ $(find /usr/ -wholename "/usr/*/easy-rsa/2.0/pkitool" | wc -l) -eq 1 ]; then
+        pkidir=$(find /usr/ -wholename "/usr/*/easy-rsa/2.0/pkitool" | sed 's#/pkitool##')
+    else
+        pkidir=$(find /usr/ -wholename "/usr/*/easy-rsa/*pkitool" | sed 's#/pkitool##')
+    fi
+    cp -n $pkidir/* .
+
+
+    ### Generate server cert & key unless they already exist
+    if [ -r "./keys/ca.crt" ] || [ -r "./keys/dh${keysize}.pem" ] || [ -r "./keys/$servername.crt" ] || [ -r "./keys/$servername.crt" ]; then
+        echo "Existing keys detected, new server and CA keys will not be generated." >&2
+    elif [ -r "./vars" ] && [ -x "./pkitool" ] && [ -x "./build-dh" ]; then
+        ### update key info environment settings
+        sed -i "s/export KEY_CN=.*/export KEY_CN=\"${servername}\"/" ./vars
+        sed -i "s/export KEY_NAME=.*/export KEY_NAME=\"${servername}\"/" ./vars
+        sed -i "s/export KEY_ORG=.*/export KEY_ORG=\"${servername}\"/" ./vars
+        sed -i "s/export KEY_OU=.*/export KEY_OU=\"${servername}\"/" ./vars
+        sed -i "s/export KEY_EMAIL=.*/export KEY_EMAIL=\"${servername}@${domainname}\"/" ./vars
+        sed -i "s/export KEY_SIZE=.*/export KEY_SIZE=${keysize}/" ./vars
+
+        ### run easy-rsa scripts to create CA and server cert
+        source ./vars
+        ./clean-all
+        ./build-dh
+        ./pkitool --initca
+        ./pkitool --server $servername
+    else
+        echo "Error: unable to copy easy-rsa tools." >&2
+	exit 1
+    fi
+
+    ### generate server config file unless it already exists
+    if [ -e "./server.conf" ]; then
+        echo "Existing server configuration file detected, server.conf will not be generated." >&2
+    elif [ -r "./keys/ca.crt" ] && [ -r "./keys/dh${keysize}.pem" ] && [ -r "./keys/$servername.crt" ] && [ -r "./keys/$servername.key" ]; then
+        echo 'port 1194' > server.conf
+        echo 'proto udp' >> server.conf
+        echo 'dev tun0' >> server.conf
+        echo 'server 172.30.1.0 255.255.255.0' >> server.conf
+        echo 'push "redirect-gateway def1"' >> server.conf
+        echo 'push "explicit-exit-notify 3"' >> server.conf
+	echo "push \"dhcp-option DNS $dnsserver\"" >> server.conf
+        echo "ca /etc/openvpn/keys/ca.crt" >> server.conf
+        echo "cert /etc/openvpn/keys/$servername.crt" >> server.conf
+        echo "key /etc/openvpn/keys/$servername.key" >> server.conf
+        echo "dh /etc/openvpn/keys/dh${keysize}.pem" >> server.conf
+        echo 'ping-timer-rem' >> server.conf
+        echo 'keepalive 10 120' >> server.conf
+        echo 'comp-lzo' >> server.conf
+        echo 'max-clients 10' >> server.conf  ### Edit this if more clients are needed
+        echo 'persist-key' >> server.conf
+        echo 'persist-tun' >> server.conf
+        echo 'status /var/log/openvpn-status.log' >> server.conf
+        echo 'log-append  /var/log/openvpn.log' >> server.conf
+        echo 'verb 4' >> server.conf
+        echo 'mute 20' >> server.conf
+        ### Probably not the best place to configure networking
+        ### But easier then figuring out per-distribution configs
+        echo 'script-security 2' >> server.conf
+        echo "up /etc/openvpn/ovpn_net.sh" >> server.conf
+        echo '#!/bin/sh' > ovpn_net.sh
+        echo "/sbin/sysctl -w net.ipv4.ip_forward=1" >> ovpn_net.sh
+        echo "/sbin/iptables -t nat -A POSTROUTING -s 172.30.1.0/24 -j SNAT --to $addr" >> ovpn_net.sh
+        echo "/sbin/iptables -I INPUT 1 -d $addr -p udp --dport 1194 -j ACCEPT" >> ovpn_net.sh
+        echo "/sbin/iptables -I INPUT 1 -i tun+ -j ACCEPT" >> ovpn_net.sh
+        echo "/sbin/iptables -I OUTPUT 1 -o tun+ -j ACCEPT" >> ovpn_net.sh
+        echo "/sbin/iptables -I FORWARD 1 -i tun+ -j ACCEPT" >> ovpn_net.sh
+        echo "/sbin/iptables -I FORWARD 1 -o tun+ -j ACCEPT" >> ovpn_net.sh
+    else
+        echo "Error: can't find server certs, did pkitool run successfully?" >&2
+	exit 1
+    fi
+
+fi
+
+
+
+###############
+# Client setup
+###############
+if [ "$clientname" != "" ]; then
+
+    ### setup pkitool env and generate client key unless it already exists
+    if [ -e "./keys/$clientname.key" ] || [ -e "./keys/$clientname.crt" ]; then
+        echo "That client key already exists, a new one will not be generated." >&2
+    elif [ -r "./vars" ] && [ -r "./keys/ca.crt" ] && [ -x "./pkitool" ]; then
+        sed -i "s/export KEY_CN=.*/export KEY_CN=\"${clientname}\"/" ./vars
+        sed -i "s/export KEY_NAME=.*/export KEY_NAME=\"${clientname}\"/" ./vars
+        sed -i "s/export KEY_SIZE=.*/export KEY_SIZE=${keysize}/" ./vars
+        source ./vars
+        ./pkitool $clientname
+    else
+        echo "Cannot find server configuration. Must configure clients from same directory as server." >&2
+        exit 1
+    fi
+
+    ### write client config file
+    if [ -e "./$clientname.ovpn" ]; then
+        echo "That client is already configured, $clientname.ovpn will not be generated." >&2
+    elif [ -r "./keys/$clientname.key" ] && [ -r "./keys/$clientname.crt" ] && [ -r "./keys/ca.crt" ]; then
+        echo "client" > $clientname.ovpn
+        echo "dev tun" >> $clientname.ovpn
+        echo "proto udp" >> $clientname.ovpn
+        echo "remote $serveraddr 1194" >> $clientname.ovpn
+        echo "resolv-retry infinite" >> $clientname.ovpn
+        echo "nobind" >> $clientname.ovpn
+	if [ "$linuxclient" == "true" ]; then
+	    echo "script-security 2" >> $clientname.ovpn
+	    echo "up /etc/openvpn/update-resolv-conf" >> $clientname.ovpn
+	    echo "down /etc/openvpn/update-resolv-conf" >> $clientname.ovpn
+	else
+	    echo "register-dns" >> $clientname.ovpn
+	fi
+        echo "persist-key" >> $clientname.ovpn
+        echo "persist-tun" >> $clientname.ovpn
+        echo "ping-timer-rem" >> $clientname.ovpn
+        echo "keepalive 10 120" >> $clientname.ovpn
+        echo "comp-lzo" >> $clientname.ovpn
+        echo "verb 4" >> $clientname.ovpn
+        echo "mute 20" >> $clientname.ovpn
+        echo "ns-cert-type server" >> $clientname.ovpn
+        echo "<ca>" >> $clientname.ovpn
+        cat ./keys/ca.crt >> $clientname.ovpn
+        echo "</ca>" >> $clientname.ovpn
+        echo "<cert>" >> $clientname.ovpn
+        cat ./keys/$clientname.crt >> $clientname.ovpn
+        echo "</cert>" >> $clientname.ovpn
+        echo "<key>" >> $clientname.ovpn
+        cat ./keys/$clientname.key >> $clientname.ovpn
+        echo "</key>" >> $clientname.ovpn
+    else
+        echo "Error: couldn't locate client key files, did pkitool run successfully?" >&2
+    fi
+fi
+
+
+
+#################
+# Enable Server
+#################
+if [ "$enableserver" == "true" ]; then
+
+    ### Fix permissions to be safe and move files to OpenVPN settings folder
+    if [ -e "./server.conf" ] && [ -e "./keys/ca.crt" ]; then
+        chmod 644 server.conf
+        chmod 744 ovpn_net.sh
+        chmod -R 400 keys
+        cp -rf server.conf ovpn_net.sh keys /etc/openvpn/
+        chown -R root:root /etc/openvpn/*
+    else
+        echo "Error: server configuration and keys must exist before server can be enabled." >&2
+        exit 1
+    fi
+
+
+    ### SELinux doesn't play nice with network config 'up' script in server.conf
+    ### Would be better to install a policy that allows openvpn to call sysctl and iptables
+    if [ -n "$(command -v getenforce)" ]; then
+        if [ "$(getenforce)" == "Enforcing" ]; then
+            echo "Warning: Disabling SELinux." >&2
+            setenforce 0
+        fi
+    fi
+
+    ### Enable & Start OpenVPN service
+    ### If systemd is pid 1 use it, else try update-rc.d or chkconfig
+    ### Not perfect, but something better would take effort
+    sysd=$(ps -eaf | grep "^root[[:space:]]*1[[:space:]].*systemd" | wc -l)
+    if [ $sysd -gt 1 ]; then
+        echo "Error: Regex found multiple instances of systemd running as PID 1." >&2
+        exit 1
+    elif [ $sysd -eq 1 ]; then
+        systemctl -f enable openvpn@server.service
+        systemctl start openvpn@server.service
+    elif [ $sysd -eq 0 ]; then
+        if [ -n "$(command -v update-rc.d)" ]; then
+            update-rc.d openvpn defaults
+        elif [ -n "$(command -v chkconfig)" ]; then
+            chkconfig openvpn on
+        else
+            echo "Error: Not using systemd, but can't find update-rc.d or chkconfig." >&2
+	    exit 1
+        fi
+        /etc/init.d/openvpn start
+    else
+        echo "Error: Couldn't determine how to enable OpenVPN service." >&2
+        exit 1
+    fi
+fi
