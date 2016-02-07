@@ -26,7 +26,7 @@ Failing on:
 
 Known Issues:
   1) Does not handle unicode names, which would be hard.
-  2) Will conflict with other uses of the 172.30.*.* subnet.
+  2) May cause problems with networks already using the 172.30.*.* subnet.
   3) Does not play nice with SELinux, and will disable it. To re-enable SELinux,
      run 'setenforce 1'. You will need to manually configure /etc/openvpn/ovpn_net.sh
      to run at boot (or find another way to make those settings persistent).
